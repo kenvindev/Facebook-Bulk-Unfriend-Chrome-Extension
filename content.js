@@ -1,5 +1,5 @@
 (() => {
-  const FBU_VERSION = "1.2.5";
+  const FBU_VERSION = "1.3.3";
 
   if (window.__FBU_ON_MESSAGE__) {
     try {
@@ -16,28 +16,47 @@
     }
   }
 
+  const isUpgrade = window.__FBU_VERSION__ !== FBU_VERSION;
   window.__FBU_VERSION__ = FBU_VERSION;
   window.__FBU_LOADED__ = true;
 
-  const STATE = {
-    friends: new Map(),
-    excludedIds: new Set(), // persisted keep-list
-    nextSeq: 0, // lower = newer (Facebook friends list order)
-    running: false,
-    stopRequested: false,
-    doneCount: 0,
-    delayMs: 5000,
-    sessionCache: null,
-    friendsDocId: null,
-    load: {
-      status: "idle",
-      message: "Waiting…",
-      cursor: null,
-      hasNextPage: true,
-      pagesLoaded: 0,
-      loading: false,
-    },
-  };
+  // Always keep existing friends list across reinject (Start must never wipe scan results)
+  const existingState = window.__FBU_STATE_;
+  const hasScannedFriends =
+    existingState &&
+    existingState.friends instanceof Map &&
+    existingState.friends.size > 0;
+
+  const STATE = hasScannedFriends
+    ? existingState
+    : !isUpgrade && existingState
+      ? existingState
+      : {
+          friends: new Map(),
+          excludedIds: new Set(),
+          nextSeq: 0,
+          running: false,
+          stopRequested: false,
+          doneCount: 0,
+          delayMs: 5000,
+          sessionCache: null,
+          friendsDocId: null,
+          load: {
+            status: "idle",
+            message: "Waiting…",
+            cursor: null,
+            hasNextPage: true,
+            pagesLoaded: 0,
+            loading: false,
+          },
+        };
+
+  window.__FBU_STATE__ = STATE;
+
+  // Only show idle hint on true first boot with empty list — never after a scan
+  const shouldBootIdle =
+    !window.__FBU_BOOTED__ && STATE.friends.size === 0 && STATE.load.status === "idle";
+  window.__FBU_BOOTED__ = true;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -81,6 +100,7 @@
         selected: Boolean(f.selected),
         excluded: Boolean(f.excluded),
         done: Boolean(f.done),
+        hasAvatar: f.hasAvatar === true,
         seq: f.seq ?? 0,
       }))
       .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
@@ -275,7 +295,7 @@
     return null;
   }
 
-  function upsertFriend({ id, numericId, name, seq }) {
+  function upsertFriend({ id, numericId, name, seq, href, hasAvatar }) {
     if (!id && !numericId) return false;
 
     const nid =
@@ -303,6 +323,8 @@
         id: key,
         numericId: nid,
         name: name || key,
+        href: href || null,
+        hasAvatar: hasAvatar === true,
         selected: false,
         excluded: Boolean(shouldExclude),
         done: false,
@@ -320,6 +342,9 @@
       friend.numericId = nid;
       if (friend.id !== nid) rekeyFriend(friend, nid);
     }
+    if (href && !friend.href) friend.href = href;
+    if (hasAvatar === true) friend.hasAvatar = true;
+    if (hasAvatar === false && friend.hasAvatar !== true) friend.hasAvatar = false;
     if (name && normalizeName(name).length >= 2) {
       if (!friend.name || friend.name === friend.id || friend.name.length < name.length) {
         friend.name = name;
@@ -334,6 +359,33 @@
       friend.selected = false;
     }
     return false;
+  }
+
+  function detectHasAvatar(root) {
+    if (!root?.querySelectorAll) return false;
+    const imgs = root.querySelectorAll("img, image");
+    for (const img of imgs) {
+      const src =
+        img.getAttribute("src") ||
+        img.getAttribute("xlink:href") ||
+        img.getAttribute("href") ||
+        "";
+      if (!src) continue;
+      // Static FB resources / silhouettes / loaders — not a real profile photo
+      if (/rsrc\.php|static\.xx\.fbcdn|animated_loading|safe_image\.php\?d=|\/images\/icons/i.test(src)) {
+        continue;
+      }
+      if (/scontent|fbcdn\.net/i.test(src)) return true;
+      if (/\.(jpg|jpeg|png|webp)(\?|$)/i.test(src)) return true;
+    }
+    return false;
+  }
+
+  function shouldUseMoreUiOnly(friend) {
+    const hasId = Boolean(friend.numericId && /^\d+$/.test(String(friend.numericId)));
+    const hasAvatar = friend.hasAvatar === true;
+    // Deleted/locked accounts: usually no avatar and/or no reliable ID
+    return !hasId || !hasAvatar;
   }
 
   // Remove same-person duplicates (one with ID, one without / vanity)
@@ -525,11 +577,18 @@
           .trim()
           .replace(/\s+/g, " ");
         if (!name || name.length < 2 || name.length > 120) continue;
-        // Prefer rows that look like people (avatar or name link)
-        const hasImg = Boolean(a.querySelector("img, image"));
-        if (!hasImg && name.split(" ").length < 1) continue;
 
-        const numericId = /^\d+$/.test(id) ? id : null;
+        // Climb to row and prefer numeric id from hovercard / profile.php?id=
+        let row = a.parentElement;
+        for (let i = 0; i < 8 && row; i += 1) {
+          const h = row.getBoundingClientRect?.().height || 0;
+          if (h >= 48 && h <= 360) break;
+          row = row.parentElement;
+        }
+        const fromRow = extractNumericFromRow(row || a.parentElement);
+        let numericId = /^\d+$/.test(id) ? id : fromRow;
+        if (!numericId && /^\d+$/.test(id)) numericId = id;
+
         // Skip obvious non-person vanity paths
         if (!numericId && /^(privacy|help|settings|login|reg|recover)$/i.test(id)) continue;
 
@@ -546,7 +605,15 @@
           if (existsWithId) continue;
         }
 
-        if (upsertFriend({ id: numericId || id, numericId, name })) added += 1;
+        if (upsertFriend({
+          id: numericId || id,
+          numericId,
+          name,
+          href: a.href,
+          hasAvatar: detectHasAvatar(row || a),
+        })) {
+          added += 1;
+        }
       }
     }
     return added;
@@ -654,11 +721,15 @@
         if (!node) continue;
         const id = String(node.id || node.userID || "");
         if (!id) continue;
-        friends.push({
-          id,
-          numericId: /^\d+$/.test(id) ? id : null,
-          name: node.name || node.short_name || id,
-        });
+      friends.push({
+        id,
+        numericId: /^\d+$/.test(id) ? id : null,
+        name: node.name || node.short_name || id,
+        hasAvatar: Boolean(
+          (node.profile_picture?.uri || node.profilePicture?.uri || "") &&
+            !/rsrc\.php/i.test(node.profile_picture?.uri || node.profilePicture?.uri || "")
+        ),
+      });
       }
       STATE.friendsDocId = docId;
       return {
@@ -886,12 +957,300 @@
   }
 
   function looksSuccessfulUnfriend(resText, httpOk) {
-    if (!httpOk) return false;
-    const lower = (resText || "").toLowerCase();
-    if (lower.includes("checkpoint") || lower.includes("login_form")) return false;
-    const parsed = parseFbAjax(resText);
-    if (parsed.json?.error || parsed.json?.errors) return false;
-    return true;
+    const analysis = analyzeUnfriendResponse(resText, httpOk);
+    return analysis.ok && !analysis.needVerify;
+  }
+
+  function analyzeUnfriendResponse(text, httpOk) {
+    if (!httpOk) return { ok: false, needVerify: false, error: "HTTP request failed" };
+    const raw = text || "";
+    const lower = raw.toLowerCase();
+    if (lower.includes("checkpoint") || lower.includes("login_form")) {
+      return { ok: false, needVerify: false, error: "Facebook checkpoint / login required" };
+    }
+
+    const parsed = parseFbAjax(raw);
+    const json = parsed.json;
+    if (!json) {
+      return { ok: false, needVerify: false, error: "Empty/non-JSON response" };
+    }
+
+    if (json.error || json.errors) {
+      return {
+        ok: false,
+        needVerify: false,
+        error: JSON.stringify(json.error || json.errors).slice(0, 180),
+      };
+    }
+    if (json.errorSummary || json.errorDescription) {
+      return {
+        ok: false,
+        needVerify: false,
+        error: String(json.errorSummary || json.errorDescription),
+      };
+    }
+
+    if (json.data) {
+      const blob = JSON.stringify(json.data);
+      if (/\"error_code\"|\"error_message\"/i.test(blob)) {
+        return { ok: false, needVerify: false, error: "GraphQL data contains error" };
+      }
+      return { ok: true, needVerify: true, error: null };
+    }
+
+    // Classic AJAX often returns opaque {__ar:1,payload:null} even when nothing changed
+    if ("payload" in json || "__ar" in json || "jsmods" in json) {
+      if (json.payload === false) {
+        return { ok: false, needVerify: false, error: "payload=false" };
+      }
+      return { ok: true, needVerify: true, error: null };
+    }
+
+    return { ok: false, needVerify: false, error: "Unrecognized response shape" };
+  }
+
+  async function verifyStillFriends(numericId) {
+    const urls = [
+      `https://www.facebook.com/profile.php?id=${encodeURIComponent(numericId)}`,
+      `https://www.facebook.com/${encodeURIComponent(numericId)}`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, {
+          credentials: "include",
+          headers: { Accept: "text/html" },
+          redirect: "follow",
+        });
+        const html = await res.text();
+        if (!html || html.length < 500) continue;
+
+        if (/"friendship_status"\s*:\s*"ARE_FRIENDS"/i.test(html)) return true;
+        if (/"friendship_status"\s*:\s*"CAN_REQUEST"/i.test(html)) return false;
+        if (/"friendship_status"\s*:\s*"CANNOT_REQUEST"/i.test(html)) return false;
+        if (/"friendship_status"\s*:\s*"OUTGOING_REQUEST"/i.test(html)) return false;
+        if (/"friendship_status"\s*:\s*"INCOMING_REQUEST"/i.test(html)) return false;
+        if (/"is_viewer_friend"\s*:\s*true/i.test(html)) return true;
+        if (/"is_viewer_friend"\s*:\s*false/i.test(html)) return false;
+
+        const hasAdd =
+          /aria-label="Add friend"/i.test(html) ||
+          /aria-label="Thêm bạn bè"/i.test(html) ||
+          /aria-label="Add Friend"/i.test(html);
+        const hasFriendsMenu =
+          (/aria-label="Friends"/i.test(html) || /aria-label="Bạn bè"/i.test(html)) &&
+          (/Unfriend/i.test(html) || /Hủy kết bạn/i.test(html));
+
+        if (hasAdd && !hasFriendsMenu) return false;
+        if (hasFriendsMenu) return true;
+      } catch {
+        /* try next */
+      }
+    }
+    return null;
+  }
+
+  function discoverUnfriendDocId() {
+    const html = document.documentElement.innerHTML;
+    const patterns = [
+      /FriendingCometUnfriendMutation["'\s,\]]{0,160}?"(\d{15,20})"/,
+      /"id":"(\d{15,20})"[\s\S]{0,120}?FriendingCometUnfriendMutation/,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m?.[1]) return m[1];
+    }
+    return "1000833884483722";
+  }
+
+  function extractNumericFromElement(el) {
+    if (!el) return null;
+
+    const attrs = [
+      el.getAttribute?.("data-hovercard"),
+      el.getAttribute?.("href"),
+      el.getAttribute?.("ajaxify"),
+      el.getAttribute?.("data-gt"),
+    ].filter(Boolean);
+
+    for (const val of attrs) {
+      let m = String(val).match(/[?&]id=(\d{5,})/);
+      if (m) return m[1];
+      m = String(val).match(/profile\.php\?id=(\d{5,})/);
+      if (m) return m[1];
+      m = String(val).match(/user\.php\?id=(\d{5,})/);
+      if (m) return m[1];
+    }
+
+    try {
+      const href = el.getAttribute?.("href");
+      if (href) {
+        const u = new URL(href, location.origin);
+        const id = u.searchParams.get("id");
+        if (id && /^\d+$/.test(id)) return id;
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  function extractNumericFromRow(row) {
+    if (!row) return null;
+    let id = extractNumericFromElement(row);
+    if (id) return id;
+
+    for (const el of row.querySelectorAll("[href], [data-hovercard], [ajaxify], [data-id]")) {
+      id = extractNumericFromElement(el);
+      if (id) return id;
+      const dataId = el.getAttribute("data-id");
+      if (dataId && /^\d{5,}$/.test(dataId)) return dataId;
+    }
+
+    const html = row.outerHTML || "";
+    const patterns = [
+      /profile\.php\?id=(\d{5,})/,
+      /user\.php\?id=(\d{5,})/,
+      /data-hovercard="[^"]*[?&]id=(\d{5,})/,
+      /"userID":"(\d{5,})"/,
+      /"entity_id":"(\d{5,})"/,
+      /friend_id[=:]"?(\d{5,})/,
+      /"id":"(\d{5,})"/,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m?.[1]) return m[1];
+    }
+    return null;
+  }
+
+  function findRowByFriendName(name) {
+    const target = normalizeName(name);
+    if (!target) return null;
+
+    const exact = [];
+    const fuzzy = [];
+    const nodes = document.querySelectorAll('a[href], [role="link"], span');
+    for (const a of nodes) {
+      const raw = (a.getAttribute("aria-label") || a.textContent || "").trim();
+      if (!raw || raw.length > 80) continue;
+      const label = normalizeName(raw);
+      if (!label) continue;
+
+      const isExact = label === target;
+      const isFuzzy =
+        !isExact &&
+        label.length >= 4 &&
+        target.length >= 4 &&
+        (label.includes(target) || target.includes(label));
+      if (!isExact && !isFuzzy) continue;
+
+      let node = a;
+      let best = null;
+      for (let i = 0; i < 12 && node && node !== document.body; i += 1) {
+        const rect = node.getBoundingClientRect?.();
+        const h = rect?.height || 0;
+        const w = rect?.width || 0;
+        if (h >= 44 && h <= 220 && w > 160) {
+          best = node;
+          const hasAction = node.querySelector(
+            '[aria-label="More"], [aria-label="Thêm"], [aria-label="Friends"], [aria-label="Bạn bè"], [role="button"]'
+          );
+          if (hasAction) break;
+        }
+        node = node.parentElement;
+      }
+      if (best) (isExact ? exact : fuzzy).push(best);
+    }
+
+    const pool = exact.length ? exact : fuzzy;
+    pool.sort((a, b) => a.getBoundingClientRect().height - b.getBoundingClientRect().height);
+    return pool[0] || null;
+  }
+
+  async function ensureFriendRowVisible(name) {
+    let row = findRowByFriendName(name);
+    if (row) {
+      row.scrollIntoView({ block: "center", behavior: "auto" });
+      await sleep(300);
+      return row;
+    }
+
+    const scroller = findScrollableFriendsContainer();
+    for (let i = 0; i < 25; i += 1) {
+      try {
+        scroller.scrollTop += Math.max(500, scroller.clientHeight * 0.8);
+      } catch {
+        window.scrollBy(0, 700);
+      }
+      await sleep(450);
+      row = findRowByFriendName(name);
+      if (row) {
+        row.scrollIntoView({ block: "center", behavior: "auto" });
+        await sleep(250);
+        return row;
+      }
+    }
+    return null;
+  }
+
+  function findNumericIdInPageHtml(name) {
+    const escaped = String(name)
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\s+/g, "\\s+");
+    const html = document.documentElement.innerHTML;
+    const patterns = [
+      new RegExp(`"id":"(\\d{5,})"\\s*,\\s*"name":"${escaped}"`, "i"),
+      new RegExp(`"name":"${escaped}"\\s*,\\s*"id":"(\\d{5,})"`, "i"),
+      new RegExp(`"id":"(\\d{5,})"[\\s\\S]{0,180}?"name":"${escaped}"`, "i"),
+      new RegExp(`"name":"${escaped}"[\\s\\S]{0,180}?"id":"(\\d{5,})"`, "i"),
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m?.[1]) return m[1];
+    }
+    return null;
+  }
+
+  async function fetchNumericIdFromProfile(vanityOrPath) {
+    const vanity = String(vanityOrPath || "")
+      .replace(/^https?:\/\/(www\.|m\.)?facebook\.com\//i, "")
+      .replace(/\/+$/, "")
+      .replace(/^\//, "");
+    if (!vanity || /^\d+$/.test(vanity)) return /^\d+$/.test(vanity) ? vanity : null;
+
+    const urls = [
+      `https://www.facebook.com/${encodeURI(vanity)}`,
+      `https://www.facebook.com/profile.php?id=${encodeURIComponent(vanity)}`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, {
+          credentials: "include",
+          headers: { Accept: "text/html" },
+          redirect: "follow",
+        });
+        const html = await res.text();
+        const patterns = [
+          /"userID":"(\d{5,})"/,
+          /"userID":(\d{5,})/,
+          /"profile_owner":\{"id":"(\d{5,})"/,
+          /"entity_id":"(\d{5,})"/,
+          /profile_id=(\d{5,})/,
+          /"user_id":"(\d{5,})"/,
+          /content="fb:\/\/profile\/(\d{5,})"/,
+          /"actorID":"(\d{5,})"/,
+        ];
+        for (const re of patterns) {
+          const m = html.match(re);
+          if (m?.[1] && m[1] !== getCookie("c_user")) return m[1];
+        }
+      } catch {
+        /* try next */
+      }
+    }
+    return null;
   }
 
   async function resolveNumericId(friend) {
@@ -902,7 +1261,196 @@
       friend.numericId = String(friend.id);
       return friend.numericId;
     }
+
+    // 1) Find row on friends list page by name
+    const row = findRowByFriendName(friend.name);
+    if (row) {
+      const fromRow = extractNumericFromRow(row);
+      if (fromRow) {
+        friend.numericId = fromRow;
+        if (friend.id !== fromRow) {
+          try {
+            rekeyFriend(friend, fromRow);
+          } catch {
+            friend.id = fromRow;
+          }
+        }
+        return fromRow;
+      }
+    }
+
+    // 2) Search embedded page JSON by name
+    const fromHtml = findNumericIdInPageHtml(friend.name);
+    if (fromHtml) {
+      friend.numericId = fromHtml;
+      return fromHtml;
+    }
+
+    // 3) Vanity username / profile path → fetch profile HTML
+    if (friend.id && !/^\d+$/.test(String(friend.id))) {
+      const fromProfile = await fetchNumericIdFromProfile(friend.id);
+      if (fromProfile) {
+        friend.numericId = fromProfile;
+        try {
+          rekeyFriend(friend, fromProfile);
+        } catch {
+          friend.id = fromProfile;
+        }
+        return fromProfile;
+      }
+    }
+
+    if (friend.href) {
+      try {
+        const u = new URL(friend.href, location.origin);
+        const idParam = u.searchParams.get("id");
+        if (idParam && /^\d+$/.test(idParam)) {
+          friend.numericId = idParam;
+          return idParam;
+        }
+        const parts = u.pathname.split("/").filter(Boolean);
+        if (parts[0] && !/^\d+$/.test(parts[0])) {
+          const fromProfile = await fetchNumericIdFromProfile(parts[0]);
+          if (fromProfile) {
+            friend.numericId = fromProfile;
+            return fromProfile;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
     return null;
+  }
+
+  function clickEl(el) {
+    if (!el) return false;
+    try {
+      el.focus?.();
+    } catch {
+      /* ignore */
+    }
+    if (typeof el.click === "function") {
+      el.click();
+      return true;
+    }
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    return true;
+  }
+
+  async function dismissOverlaysLight() {
+    for (let i = 0; i < 2; i += 1) {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true })
+      );
+      await sleep(120);
+    }
+  }
+
+  // Fallback for accounts with no resolvable ID (placeholder avatar / limited profile)
+  async function uiUnfriendByName(friend) {
+    await dismissOverlaysLight();
+    const row = findRowByFriendName(friend.name);
+    if (!row) {
+      throw new Error("Row not found — scroll so this person is visible on /friends/list");
+    }
+
+    row.scrollIntoView({ block: "center", behavior: "auto" });
+    await sleep(350);
+
+    let btn =
+      row.querySelector('[aria-label="More"]') ||
+      row.querySelector('[aria-label="Thêm"]') ||
+      row.querySelector('[aria-label="Friends"]') ||
+      row.querySelector('[aria-label="Bạn bè"]') ||
+      row.querySelector('[aria-label="See options"]') ||
+      row.querySelector('[aria-label="Tùy chọn"]');
+
+    if (!btn) {
+      const buttons = [...row.querySelectorAll('[role="button"], button')].filter((el) => {
+        if (el.closest(".fbu-controls")) return false;
+        const label = (el.getAttribute("aria-label") || el.textContent || "").trim().toLowerCase();
+        if (
+          label.includes("bạn chung") ||
+          label.includes("mutual") ||
+          label.includes("message") ||
+          label.includes("nhắn")
+        ) {
+          return false;
+        }
+        return true;
+      });
+      btn = buttons[buttons.length - 1] || null;
+    }
+
+    if (!btn) throw new Error("No More/⋯ button in row");
+
+    clickEl(btn);
+    await sleep(700);
+
+    const unfriendPatterns = [
+      "unfriend",
+      "hủy kết bạn",
+      "huy ket ban",
+      "remove friend",
+      "xóa bạn",
+      "xoa ban",
+    ];
+
+    let menuItem = null;
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && !menuItem) {
+      const items = [
+        ...document.querySelectorAll('[role="menuitem"]'),
+        ...document.querySelectorAll('[role="menu"] [role="button"]'),
+      ];
+      for (const el of items) {
+        const text = (el.getAttribute("aria-label") || el.textContent || "")
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, " ");
+        if (unfriendPatterns.some((p) => text.includes(p))) {
+          menuItem = el;
+          break;
+        }
+      }
+      if (!menuItem) await sleep(150);
+    }
+
+    if (!menuItem) {
+      await dismissOverlaysLight();
+      throw new Error("Unfriend not in ⋯ menu");
+    }
+
+    clickEl(menuItem);
+    await sleep(500);
+
+    const confirmDeadline = Date.now() + 2500;
+    while (Date.now() < confirmDeadline) {
+      const confirmBtn =
+        document.querySelector('[aria-label="Confirm"], [aria-label="Xác nhận"]') ||
+        [...document.querySelectorAll('[role="dialog"] [role="button"], [role="dialog"] button')].find(
+          (el) => {
+            const t = (el.textContent || "").trim().toLowerCase();
+            return (
+              t === "confirm" ||
+              t === "xác nhận" ||
+              t.includes("confirm") ||
+              t.includes("hủy kết bạn")
+            );
+          }
+        );
+      if (confirmBtn) {
+        clickEl(confirmBtn);
+        break;
+      }
+      await sleep(120);
+    }
+
+    await sleep(400);
+    await dismissOverlaysLight();
+    return true;
   }
 
   async function apiUnfriend(numericId, session) {
@@ -917,6 +1465,26 @@
 
     const attempts = [
       {
+        name: "graphql_unfriend",
+        url: "https://www.facebook.com/api/graphql/",
+        body: {
+          ...common,
+          fb_api_caller_class: "RelayModern",
+          fb_api_req_friendly_name: "FriendingCometUnfriendMutation",
+          variables: JSON.stringify({
+            input: {
+              source: "friends_list",
+              unfriended_user_id: String(numericId),
+              actor_id: String(session.userId),
+              client_mutation_id: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+            },
+            scale: 1,
+          }),
+          doc_id: discoverUnfriendDocId(),
+          server_timestamps: "true",
+        },
+      },
+      {
         name: "removefriendconfirm",
         url: "https://www.facebook.com/ajax/profile/removefriendconfirm.php",
         body: {
@@ -925,6 +1493,7 @@
           uid: numericId,
           unref: "bd_profile_button",
           confirmed: "1",
+          norefresh: "true",
         },
       },
       {
@@ -934,11 +1503,13 @@
           ...common,
           friend: numericId,
           type: "friend",
+          confirmed: "1",
         },
       },
     ];
 
-    let lastError = "All API endpoints failed";
+    let lastError = "All API endpoints failed verification";
+
     for (const attempt of attempts) {
       try {
         const res = await fetch(attempt.url, {
@@ -946,24 +1517,39 @@
           credentials: "include",
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
+            "X-FB-Friendly-Name":
+              attempt.name === "graphql_unfriend"
+                ? "FriendingCometUnfriendMutation"
+                : "XMLHttpRequest",
             "X-Requested-With": "XMLHttpRequest",
           },
           body: new URLSearchParams(attempt.body).toString(),
         });
         const text = await res.text();
-        const parsed = parseFbAjax(text);
-        if (parsed.json?.error || parsed.json?.errors) {
-          lastError = `${attempt.name}: ${JSON.stringify(parsed.json.error || parsed.json.errors)}`;
+        const analysis = analyzeUnfriendResponse(text, res.ok);
+        if (!analysis.ok) {
+          lastError = `${attempt.name}: ${analysis.error}`;
           continue;
         }
-        if (looksSuccessfulUnfriend(text, res.ok)) {
-          return { ok: true, endpoint: attempt.name };
+
+        await sleep(900);
+        const stillFriends = await verifyStillFriends(numericId);
+        if (stillFriends === true) {
+          lastError = `${attempt.name}: fake OK — profile still ARE_FRIENDS`;
+          log(`Fake success from ${attempt.name} — still friends`, "err");
+          continue;
         }
-        lastError = `${attempt.name}: HTTP ${res.status}`;
+        if (stillFriends === false) {
+          return { ok: true, endpoint: attempt.name, verified: true };
+        }
+
+        lastError = `${attempt.name}: could not verify friendship after call`;
+        log(`Unverified response from ${attempt.name} — not marking done`, "err");
       } catch (err) {
         lastError = `${attempt.name}: ${err.message}`;
       }
     }
+
     return { ok: false, error: lastError };
   }
 
@@ -1030,18 +1616,65 @@
 
   async function unfriendOne(friend, session) {
     friend.processing = true;
-    const numericId = await resolveNumericId(friend);
-    if (!numericId) {
-      friend.processing = false;
-      throw new Error(`Cannot resolve numeric ID for ${friend.name}`);
+    pushFriendsUpdate("processing");
+
+    // Refresh avatar flag from live row when possible
+    const liveRow = findRowByFriendName(friend.name);
+    if (liveRow) {
+      const liveAvatar = detectHasAvatar(liveRow);
+      if (liveAvatar) friend.hasAvatar = true;
+      else if (friend.hasAvatar !== true) friend.hasAvatar = false;
     }
-    log(`API unfriend ${friend.name} (id=${numericId})`, "info");
+
+    const uiOnly = shouldUseMoreUiOnly(friend);
+
+    if (uiOnly) {
+      const reason = !friend.numericId
+        ? "no ID"
+        : "no avatar (likely deleted/locked)";
+      log(`Unfriend via ⋯ More (${reason}): ${friend.name}`, "info");
+      try {
+        const row = await ensureFriendRowVisible(friend.name);
+        if (!row) {
+          throw new Error("Person not visible on friends list — scroll to them then retry");
+        }
+        await uiUnfriendByName(friend);
+        friend.done = true;
+        friend.selected = false;
+        friend.processing = false;
+        STATE.doneCount += 1;
+        pushFriendsUpdate("done-one");
+        log(`Done via More menu: ${friend.name}`, "ok");
+        return;
+      } catch (err) {
+        friend.processing = false;
+        throw new Error(err.message || "More menu unfriend failed");
+      }
+    }
+
+    // Has avatar + numeric ID → API first; More only if API fails
+    const numericId = String(friend.numericId);
+    log(`API unfriend (avatar+ID): ${friend.name} (id=${numericId})`, "info");
     const result = await apiUnfriend(numericId, session);
     if (!result.ok) {
-      friend.processing = false;
-      throw new Error(result.error || "API unfriend failed");
+      log(`API failed for ${friend.name}: ${result.error} — trying ⋯ More`, "err");
+      try {
+        await ensureFriendRowVisible(friend.name);
+        await uiUnfriendByName(friend);
+        friend.done = true;
+        friend.selected = false;
+        friend.processing = false;
+        STATE.doneCount += 1;
+        pushFriendsUpdate("done-one");
+        log(`Done via More menu: ${friend.name}`, "ok");
+        return;
+      } catch (err) {
+        friend.processing = false;
+        throw new Error(err.message || result.error || "Unfriend failed");
+      }
     }
-    log(`Done via ${result.endpoint}: ${friend.name}`, "ok");
+
+    log(`Done via ${result.endpoint} (verified): ${friend.name}`, "ok");
     friend.done = true;
     friend.selected = false;
     friend.processing = false;
@@ -1082,7 +1715,7 @@
       };
     }
 
-    log(`API batch start: ${queue.length} friend(s), delay ${STATE.delayMs / 1000}s`, "info");
+    log(`Batch start: ${queue.length} friend(s), delay ${STATE.delayMs / 1000}s (API if avatar+ID, else More UI)`, "info");
 
     (async () => {
       for (let i = 0; i < queue.length; i += 1) {
@@ -1113,7 +1746,7 @@
       STATE.running = false;
       broadcast("RUNNING", { running: false });
       broadcast("DONE_BATCH", {
-        message: "Batch finished (API)",
+        message: "Batch finished",
         stats: getStats(),
         friends: getFriendsPayload(),
       });
@@ -1123,7 +1756,7 @@
     return {
       ok: true,
       running: true,
-      message: `API unfriend started (${queue.length})`,
+      message: `Unfriend started (${queue.length})`,
       level: "info",
       stats: getStats(),
       friends: getFriendsPayload(),
@@ -1264,19 +1897,30 @@
   window.__FBU_ON_MESSAGE__ = onMessage;
   chrome.runtime.onMessage.addListener(onMessage);
 
-  // Only check session on load — do NOT auto-scan friends (wait for Rescan click)
-  setTimeout(() => {
-    const session = getSession(true);
-    broadcast("SESSION", { session });
-    loadExcludedFromStorage().then(() => {
-      setLoadState({
-        status: "idle",
-        message: session.ok
-          ? "Idle — click Reload friends to scan"
-          : session.message,
-        loading: false,
-        hasNextPage: false,
+  // Only check session on first boot / upgrade — do NOT auto-scan; do NOT reset after Rescan
+  if (shouldBootIdle) {
+    setTimeout(() => {
+      const session = getSession(true);
+      broadcast("SESSION", { session });
+      loadExcludedFromStorage().then(() => {
+        // Preserve completed load if reinjected mid-session after upgrade with empty state
+        if (STATE.friends.size > 0) {
+          setLoadState({
+            status: "complete",
+            message: `Loaded ${STATE.friends.size} friends`,
+            loading: false,
+          });
+          return;
+        }
+        setLoadState({
+          status: "idle",
+          message: session.ok
+            ? "Idle — click Reload friends to scan"
+            : session.message,
+          loading: false,
+          hasNextPage: false,
+        });
       });
-    });
-  }, 400);
+    }, 400);
+  }
 })();

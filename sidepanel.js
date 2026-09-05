@@ -176,9 +176,11 @@
       name.innerHTML = `${escapeHtml(friend.name)}${
         friend.excluded
           ? `<small>Protected (Keep)</small>`
-          : friend.numericId
-            ? `<small>${escapeHtml(String(friend.numericId))}</small>`
-            : ""
+          : `<small>${
+              friend.hasAvatar ? "Avatar" : "No avatar"
+            } · ${
+              friend.numericId ? escapeHtml(String(friend.numericId)) : "No ID · More UI"
+            }</small>`
       }`;
 
       const keep = document.createElement("input");
@@ -210,14 +212,43 @@
       .replace(/"/g, "&quot;");
   }
 
-  function applyFriends(nextFriends, stats, load) {
+  function applyFriends(nextFriends, stats, load, { allowEmpty = false } = {}) {
     if (Array.isArray(nextFriends)) {
-      friends = nextFriends;
-      renderFriends();
+      // Never wipe a scanned list with an accidental empty payload (e.g. after reinject)
+      if (nextFriends.length > 0 || allowEmpty || friends.length === 0) {
+        friends = nextFriends;
+        renderFriends();
+      }
     }
-    if (stats) updateStats(stats);
-    else updateStats();
-    if (load) updateLoadUI(load);
+    if (stats) {
+      // Keep totals if empty wipe was blocked
+      if (!(stats.total === 0 && friends.length > 0 && !allowEmpty)) {
+        updateStats(stats);
+      } else {
+        updateStats({
+          total: friends.length,
+          selected: friends.filter((f) => f.selected).length,
+          excluded: friends.filter((f) => f.excluded).length,
+          done: friends.filter((f) => f.done).length,
+        });
+      }
+    } else {
+      updateStats();
+    }
+    if (load) {
+      const isSpuriousIdle =
+        friends.length > 0 &&
+        (load.status === "idle" || load.message === "Waiting…" || /click Reload friends/i.test(load.message || ""));
+      if (!isSpuriousIdle) {
+        updateLoadUI(load);
+      } else {
+        updateLoadUI({
+          status: "complete",
+          message: `Loaded ${friends.length} friends`,
+          loading: false,
+        });
+      }
+    }
   }
 
   async function getFriendsListTab() {
@@ -228,7 +259,7 @@
     return fbTabs.find((t) => t.url?.includes("/friends")) || fbTabs[0] || null;
   }
 
-  async function sendToContent(payload) {
+  async function sendToContent(payload, { forceInject = false } = {}) {
     const tab = await getFriendsListTab();
     if (!tab?.id) {
       updateSessionUI(null);
@@ -240,19 +271,28 @@
       throw new Error("No Facebook friends tab found");
     }
 
-    try {
-      return await chrome.tabs.sendMessage(tab.id, payload);
-    } catch {
+    const inject = async () => {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ["content.js"],
       });
+    };
+
+    if (forceInject) {
+      await inject();
+    }
+
+    try {
+      return await chrome.tabs.sendMessage(tab.id, payload);
+    } catch {
+      await inject();
       return await chrome.tabs.sendMessage(tab.id, payload);
     }
   }
 
   async function refreshStatus() {
     try {
+      // Do NOT forceInject here — reinjecting wipes friends/load state every poll
       const res = await sendToContent({ type: "GET_STATUS" });
       if (!res?.ok) {
         updateSessionUI(null);
@@ -262,6 +302,10 @@
       updateSessionUI(res.session);
       applyFriends(res.friends || [], res.stats || {}, res.load);
       setRunning(Boolean(res.running));
+      if (res.version) {
+        const sub = document.querySelector(".subtitle");
+        if (sub) sub.textContent = `API mode · v${res.version} · manual Rescan`;
+      }
     } catch (err) {
       updateSessionUI(null);
       updateLoadUI({ status: "error", message: err.message, loading: false });
@@ -270,10 +314,18 @@
 
   async function runAction(type, extra = {}) {
     try {
-      const res = await sendToContent({ type, ...extra });
+      // Only Rescan may reinject. Start must use the already-scanned content state.
+      const forceInject = ["RESCAN", "LOAD_FRIENDS"].includes(type);
+      const res = await sendToContent({ type, ...extra }, { forceInject });
       if (res?.session) updateSessionUI(res.session);
       if (res?.friends || res?.stats || res?.load) {
-        applyFriends(res.friends, res.stats, res.load);
+        applyFriends(res.friends, res.stats, res.load, {
+          allowEmpty: type === "RESCAN" || type === "LOAD_FRIENDS",
+        });
+      }
+      if (res?.version) {
+        const sub = document.querySelector(".subtitle");
+        if (sub) sub.textContent = `API mode · v${res.version} · manual Rescan`;
       }
       if (!res?.ok) {
         addLog(res?.error || "Action failed", "err");
