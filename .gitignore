@@ -1,0 +1,25 @@
+# Dependencies / build
+node_modules/
+dist/
+*.zip
+*.crx
+*.pem
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs / env / secrets
+*.log
+.env
+.env.*
+*.local
+
+# Chrome extension packaging leftovers
+*.crx
+web-ext-artifacts/

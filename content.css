@@ -1,0 +1,60 @@
+/* Controls injected next to each friend row */
+.fbu-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+  vertical-align: middle;
+  z-index: 5;
+  position: relative;
+}
+
+.fbu-check,
+.fbu-exclude {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  accent-color: #1877f2;
+}
+
+.fbu-exclude-btn {
+  border: 1px solid #ccd0d5;
+  background: #f0f2f5;
+  color: #050505;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  cursor: pointer;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.fbu-exclude-btn.is-excluded {
+  background: #fff3cd;
+  border-color: #f0c36d;
+  color: #7a5b00;
+}
+
+.fbu-row-wrap {
+  outline: 2px solid transparent;
+  border-radius: 8px;
+  transition: outline-color 0.15s ease;
+}
+
+.fbu-row-wrap.is-selected:not(.is-excluded) {
+  outline-color: rgba(24, 119, 242, 0.55);
+}
+
+.fbu-row-wrap.is-excluded {
+  outline-color: rgba(243, 156, 18, 0.7);
+  opacity: 0.85;
+}
+
+.fbu-row-wrap.is-done {
+  outline-color: rgba(46, 204, 113, 0.7);
+}
+
+.fbu-row-wrap.is-processing {
+  outline-color: rgba(231, 76, 60, 0.8);
+}

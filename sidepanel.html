@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bulk Unfriend</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>Bulk Unfriend</h1>
+    <p class="subtitle">API mode · auto-load friends</p>
+  </header>
+
+  <section class="session-card" id="sessionCard">
+    <div class="session-top">
+      <span class="dot" id="sessionDot"></span>
+      <strong id="sessionTitle">Checking session…</strong>
+    </div>
+    <p class="session-msg" id="sessionMessage">Reading Facebook cookies / fb_dtsg…</p>
+    <dl class="session-meta">
+      <div>
+        <dt>User ID</dt>
+        <dd id="sessionUserId">—</dd>
+      </div>
+      <div>
+        <dt>fb_dtsg</dt>
+        <dd id="sessionToken">—</dd>
+      </div>
+      <div>
+        <dt>Mode</dt>
+        <dd>Session API</dd>
+      </div>
+    </dl>
+    <button type="button" class="btn btn-secondary btn-full" id="btnRefreshSession">Refresh session</button>
+  </section>
+
+  <section class="load-card" id="loadCard">
+    <div class="session-top">
+      <span class="dot warn" id="loadDot"></span>
+      <strong id="loadTitle">Friends load</strong>
+    </div>
+    <p class="session-msg" id="loadMessage">Waiting to load friends…</p>
+  </section>
+
+  <section class="stats">
+    <div class="stat">
+      <span class="stat-value" id="statTotal">0</span>
+      <span class="stat-label">Found</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value" id="statSelected">0</span>
+      <span class="stat-label">Selected</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value" id="statExcluded">0</span>
+      <span class="stat-label">Excluded</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value" id="statDone">0</span>
+      <span class="stat-label">Done</span>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Selection</h2>
+    <div class="btn-row">
+      <button type="button" class="btn btn-primary" id="btnSelectAll">Select All</button>
+      <button type="button" class="btn btn-ghost" id="btnUnselectAll">Unselect All</button>
+    </div>
+    <button type="button" class="btn btn-secondary btn-full" id="btnClearExcluded">Clear all Excludes</button>
+    <p class="hint">
+      Tick <strong>Keep</strong> on friends you must not unfriend. <strong>Select All</strong> always skips Keep/Excluded people.
+    </p>
+  </section>
+
+  <section class="friends-block">
+    <div class="friends-header">
+      <h2>Friends</h2>
+      <div class="view-tabs" role="tablist">
+        <button type="button" class="view-tab is-active" data-view="all">All</button>
+        <button type="button" class="view-tab" data-view="selected">Selected</button>
+        <button type="button" class="view-tab" data-view="excluded">Keep / Excluded</button>
+      </div>
+      <input type="search" id="friendFilter" class="friend-filter" placeholder="Filter by name…" />
+      <div class="friends-cols">
+        <span>Select</span>
+        <span>Name</span>
+        <span>Keep</span>
+      </div>
+    </div>
+    <div id="friendsList" class="friends-list"></div>
+  </section>
+
+  <section class="block">
+    <h2>Delay per unfriend</h2>
+    <div class="delay-group" role="radiogroup" aria-label="Delay">
+      <label class="delay-option">
+        <input type="radio" name="delay" value="3000" />
+        <span>3s</span>
+      </label>
+      <label class="delay-option">
+        <input type="radio" name="delay" value="5000" checked />
+        <span>5s</span>
+      </label>
+      <label class="delay-option">
+        <input type="radio" name="delay" value="8000" />
+        <span>8s</span>
+      </label>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Actions</h2>
+    <div class="btn-row">
+      <button type="button" class="btn btn-danger" id="btnStart">Start Unfriend</button>
+      <button type="button" class="btn btn-ghost" id="btnStop" disabled>Stop</button>
+    </div>
+    <button type="button" class="btn btn-secondary btn-full" id="btnRescan">Reload friends (Rescan)</button>
+  </section>
+
+  <section class="log-block">
+    <div class="log-header">
+      <h2>Log</h2>
+      <button type="button" class="btn-text" id="btnClearLog">Clear</button>
+    </div>
+    <ul id="logList" class="log-list"></ul>
+  </section>
+
+  <footer class="footer">
+    Friends are loaded automatically via Facebook session API.
+  </footer>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
