@@ -144,7 +144,11 @@
         ? "Loading friends from API…"
         : listView === "excluded"
           ? "No excluded friends yet. Tick Keep on people you want to protect."
-          : "Click Reload friends to scan the list.";
+          : listView === "selected"
+            ? "No selected friends — open All and tick people, or Select All."
+            : friends.length > 0
+              ? "No matches for this filter."
+              : "Click Reload friends to scan the list.";
       els.friendsList.appendChild(empty);
       return;
     }
@@ -382,8 +386,7 @@
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.source !== "fbu-content") return;
     if (message.type === "STATS") {
-      updateStats(message.stats || {});
-      if (message.load) updateLoadUI(message.load);
+      applyFriends(message.friends, message.stats || {}, message.load);
     }
     if (message.type === "FRIENDS" || message.type === "LOAD_STATE") {
       applyFriends(message.friends, message.stats, message.load);

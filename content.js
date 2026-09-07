@@ -1,5 +1,5 @@
 (() => {
-  const FBU_VERSION = "1.3.3";
+  const FBU_VERSION = "1.3.4";
 
   if (window.__FBU_ON_MESSAGE__) {
     try {
@@ -21,7 +21,7 @@
   window.__FBU_LOADED__ = true;
 
   // Always keep existing friends list across reinject (Start must never wipe scan results)
-  const existingState = window.__FBU_STATE_;
+  const existingState = window.__FBU_STATE__;
   const hasScannedFriends =
     existingState &&
     existingState.friends instanceof Map &&
@@ -125,7 +125,11 @@
   }
 
   function pushStats() {
-    broadcast("STATS", { stats: getStats(), load: getLoadState() });
+    broadcast("STATS", {
+      stats: getStats(),
+      load: getLoadState(),
+      friends: getFriendsPayload(),
+    });
   }
 
   function getCookie(name) {
@@ -510,6 +514,41 @@
     return null;
   }
 
+  function readPageInfo(conn) {
+    const pi = conn?.page_info || conn?.pageInfo || {};
+    return {
+      endCursor: pi.end_cursor || pi.endCursor || null,
+      hasNextPage: Boolean(pi.has_next_page ?? pi.hasNextPage),
+    };
+  }
+
+  function shouldContinueFriendsPage(page, prevCursor) {
+    if (!page) return false;
+    const cursor = page.cursor || null;
+    if (!cursor) return false;
+    if (prevCursor && cursor === prevCursor) return false;
+    if (page.hasNextPage) return true;
+    // FB sometimes omits has_next_page even when more pages exist
+    if (page.friends.length >= 8) return true;
+    return false;
+  }
+
+  function detectListedFriendCount() {
+    const text = document.body?.innerText || "";
+    const patterns = [
+      /([\d][\d.,]*)\s*người bạn/i,
+      /([\d][\d.,]*)\s*friends\b/i,
+      /Friends\s*\(([\d][\d.,]*)\)/i,
+    ];
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (!m) continue;
+      const n = parseInt(String(m[1]).replace(/[.,\s]/g, ""), 10);
+      if (Number.isFinite(n) && n > 0 && n < 20000) return n;
+    }
+    return null;
+  }
+
   function seedFriendsFromHtml() {
     const html = document.documentElement.innerHTML;
     let added = 0;
@@ -638,17 +677,23 @@
     return best;
   }
 
-  async function autoScrollAndScrapeFriends() {
+  async function autoScrollAndScrapeFriends(targetCount = null) {
     const scroller = findScrollableFriendsContainer();
     let stableRounds = 0;
     let lastCount = STATE.friends.size;
+    const maxRounds = targetCount && targetCount > STATE.friends.size ? 250 : 120;
+    const stableLimit = targetCount && STATE.friends.size < targetCount * 0.9 ? 12 : 6;
 
-    for (let i = 0; i < 60 && stableRounds < 5; i += 1) {
+    for (let i = 0; i < maxRounds && stableRounds < stableLimit; i += 1) {
+      if (targetCount && STATE.friends.size >= targetCount) break;
+
       seedFriendsFromDom();
       dedupeFriends();
       setLoadState({
         status: "loading",
-        message: `Auto-loading friends… ${STATE.friends.size} found (scan ${i + 1})`,
+        message: targetCount
+          ? `Scanning page… ${STATE.friends.size}/${targetCount} (scan ${i + 1})`
+          : `Auto-loading friends… ${STATE.friends.size} found (scan ${i + 1})`,
         loading: true,
       });
       pushFriendsUpdate("scroll-scan");
@@ -656,9 +701,15 @@
       try {
         scroller.scrollTop = scroller.scrollTop + Math.max(700, scroller.clientHeight * 0.9);
       } catch {
-        window.scrollBy(0, 900);
+        /* ignore */
       }
-      await sleep(700);
+      try {
+        window.scrollBy(0, 900);
+        (document.scrollingElement || document.documentElement).scrollTop += 900;
+      } catch {
+        /* ignore */
+      }
+      await sleep(550);
 
       if (STATE.friends.size <= lastCount) stableRounds += 1;
       else {
@@ -670,9 +721,9 @@
 
   async function fetchFriendsPage(session, cursor, docId, friendlyName) {
     const variables = {
-      count: 50,
+      count: 30,
       cursor: cursor || null,
-      scale: 1,
+      scale: 1.5,
     };
 
     const body = new URLSearchParams({
@@ -714,28 +765,28 @@
       if (!conn) continue;
 
       const edges = conn.edges || [];
-      const pageInfo = conn.page_info || {};
+      const pageInfo = readPageInfo(conn);
       const friends = [];
       for (const edge of edges) {
         const node = edge?.node;
         if (!node) continue;
         const id = String(node.id || node.userID || "");
         if (!id) continue;
-      friends.push({
-        id,
-        numericId: /^\d+$/.test(id) ? id : null,
-        name: node.name || node.short_name || id,
-        hasAvatar: Boolean(
-          (node.profile_picture?.uri || node.profilePicture?.uri || "") &&
-            !/rsrc\.php/i.test(node.profile_picture?.uri || node.profilePicture?.uri || "")
-        ),
-      });
+        friends.push({
+          id,
+          numericId: /^\d+$/.test(id) ? id : null,
+          name: node.name || node.short_name || id,
+          hasAvatar: Boolean(
+            (node.profile_picture?.uri || node.profilePicture?.uri || "") &&
+              !/rsrc\.php/i.test(node.profile_picture?.uri || node.profilePicture?.uri || "")
+          ),
+        });
       }
       STATE.friendsDocId = docId;
       return {
         friends,
-        cursor: pageInfo.end_cursor || null,
-        hasNextPage: Boolean(pageInfo.has_next_page),
+        cursor: pageInfo.endCursor || null,
+        hasNextPage: pageInfo.hasNextPage,
       };
     }
 
@@ -747,18 +798,24 @@
     const names = [
       "FriendingCometFriendsListPaginationQuery",
       "FriendingCometAllFriendsAppCollectionPageContentQuery",
+      "FriendsListContentPaginationQuery",
     ];
     let lastErr = "GraphQL failed";
-    let cursor = STATE.load.cursor;
+    let cursor = null;
     let hasNext = true;
     let pages = 0;
     let working = null;
+    let emptyPages = 0;
 
     // Discover a working doc_id on first page
     for (const name of names) {
       for (const docId of docIds) {
         try {
           const page = await fetchFriendsPage(session, null, docId, name);
+          if (!page.friends.length) {
+            lastErr = `Empty friends page (${name})`;
+            continue;
+          }
           working = { docId, name };
           let added = 0;
           let seq = STATE.nextSeq;
@@ -769,13 +826,16 @@
           STATE.nextSeq = seq;
           pages = 1;
           cursor = page.cursor;
-          hasNext = page.hasNextPage && page.friends.length > 0;
+          hasNext = shouldContinueFriendsPage(page, null);
           STATE.load.pagesLoaded = pages;
           STATE.load.cursor = cursor;
           STATE.load.hasNextPage = hasNext;
           dedupeFriends();
           pushFriendsUpdate("graphql-page");
-          log(`GraphQL OK (${name}/${docId}): +${added}, total ${STATE.friends.size}`, "ok");
+          log(
+            `GraphQL OK (${name}): +${added}, total ${STATE.friends.size}, next=${hasNext}`,
+            "ok"
+          );
           break;
         } catch (err) {
           lastErr = err.message;
@@ -786,13 +846,20 @@
 
     if (!working) throw new Error(lastErr);
 
-    while (hasNext && pages < 200) {
+    while (hasNext && pages < 400) {
       setLoadState({
         status: "loading",
         message: `Loading friends via API… page ${pages + 1} (${STATE.friends.size} found)`,
         loading: true,
       });
-      const page = await fetchFriendsPage(session, cursor, working.docId, working.name);
+      const prevCursor = cursor;
+      let page;
+      try {
+        page = await fetchFriendsPage(session, cursor, working.docId, working.name);
+      } catch (err) {
+        log(`GraphQL page ${pages + 1} failed: ${err.message}`, "err");
+        break;
+      }
       let added = 0;
       let seq = STATE.nextSeq;
       for (const f of page.friends) {
@@ -802,7 +869,13 @@
       STATE.nextSeq = seq;
       pages += 1;
       cursor = page.cursor;
-      hasNext = page.hasNextPage && page.friends.length > 0;
+      hasNext = shouldContinueFriendsPage(page, prevCursor);
+      if (added === 0) {
+        emptyPages += 1;
+        if (emptyPages >= 2) hasNext = false;
+      } else {
+        emptyPages = 0;
+      }
       STATE.load.pagesLoaded = pages;
       STATE.load.cursor = cursor;
       STATE.load.hasNextPage = hasNext;
@@ -810,7 +883,7 @@
       pushFriendsUpdate("graphql-page");
       log(`API page ${pages}: +${added} (total ${STATE.friends.size})`, "info");
       if (!hasNext) break;
-      await sleep(350);
+      await sleep(280);
     }
     return pages;
   }
@@ -879,28 +952,36 @@
     });
 
     try {
+      const expectedCount = detectListedFriendCount();
+      if (expectedCount) {
+        log(`Facebook shows ~${expectedCount} friends — loading until close`, "info");
+      }
+
       // 1) GraphQL first — Facebook returns newest friends first
       try {
         await tryGraphqlFriends(session);
       } catch (err) {
         log(`GraphQL friends failed: ${err.message}`, "err");
-        try {
-          const fallback = await fetchFriendsTypeahead(session);
-          let added = 0;
-          let seq = STATE.nextSeq;
-          for (const f of fallback) {
-            if (upsertFriend({ ...f, seq })) added += 1;
-            seq += 1;
-          }
-          STATE.nextSeq = seq;
-          log(`Typeahead fallback: +${added}`, added ? "ok" : "err");
-          pushFriendsUpdate("typeahead");
-        } catch (err2) {
-          log(`Typeahead failed: ${err2.message}`, "err");
-        }
       }
 
-      // 2) Fill gaps from page HTML / visible DOM (append only — keeps API order)
+      // 2) Always merge typeahead (covers cases where GraphQL stops early)
+      try {
+        const fallback = await fetchFriendsTypeahead(session);
+        let added = 0;
+        let seq = STATE.nextSeq;
+        for (const f of fallback) {
+          if (upsertFriend({ ...f, seq })) added += 1;
+          seq += 1;
+        }
+        STATE.nextSeq = seq;
+        dedupeFriends();
+        log(`Typeahead merge: +${added} (total ${STATE.friends.size})`, added ? "ok" : "info");
+        pushFriendsUpdate("typeahead");
+      } catch (err2) {
+        log(`Typeahead failed: ${err2.message}`, "err");
+      }
+
+      // 3) Fill gaps from page HTML / visible DOM (append only — keeps API order)
       const htmlAdded = seedFriendsFromHtml();
       dedupeFriends();
       const domAdded = seedFriendsFromDom();
@@ -911,21 +992,29 @@
         "info"
       );
 
-      // 3) Auto-scroll page for more (older friends further down)
-      log("Auto-scanning friends page for more…", "info");
-      await autoScrollAndScrapeFriends();
-      const removedFinal = dedupeFriends();
-      if (removedFinal) log(`Removed ${removedFinal} duplicate friend row(s)`, "info");
-      pushFriendsUpdate("dedupe-final");
+      // 4) Auto-scroll page for more (older friends further down)
+      const stillShort =
+        expectedCount && STATE.friends.size < Math.floor(expectedCount * 0.92);
+      if (stillShort || STATE.friends.size < 50) {
+        log("Auto-scanning friends page for more…", "info");
+        await autoScrollAndScrapeFriends(expectedCount);
+        const removedFinal = dedupeFriends();
+        if (removedFinal) log(`Removed ${removedFinal} duplicate friend row(s)`, "info");
+        pushFriendsUpdate("dedupe-final");
+      }
 
       STATE.load.loading = false;
       STATE.load.hasNextPage = false;
       const total = STATE.friends.size;
+      const shortNote =
+        expectedCount && total < Math.floor(expectedCount * 0.9)
+          ? ` (FB shows ${expectedCount} — try Reload again while scrolling the list)`
+          : "";
       setLoadState({
         status: total > 0 ? "complete" : "error",
         message:
           total > 0
-            ? `Loaded ${total} friends`
+            ? `Loaded ${total} friends${shortNote}`
             : "No friends found — open /friends/list, wait for list, then Reload",
         loading: false,
       });
@@ -938,7 +1027,7 @@
         stats: getStats(),
         friends: getFriendsPayload(),
         session,
-        message: total > 0 ? `Loaded ${total} friends` : "No friends found",
+        message: total > 0 ? `Loaded ${total} friends${shortNote}` : "No friends found",
         level: total > 0 ? "ok" : "err",
       };
     } catch (err) {
